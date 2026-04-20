@@ -1,0 +1,140 @@
+import torch
+import torch.nn as nn
+from .prunable_layer import PrunableLinear
+
+
+class SelfPruningNet(nn.Module):
+    """
+    Feed-forward network for CIFAR-10 whose linear layers can prune
+    themselves during training via learnable sigmoid gates.
+
+    Parameters
+    ----------
+    dropout_rate : float – dropout probability applied after each hidden
+                           activation (default: 0.3)
+    gate_init    : float – initial value passed to every PrunableLinear
+                           (default: 0.0 → gates start at ~0.5)
+    """
+
+    # CIFAR-10 image: 3 channels × 32 × 32 pixels
+    INPUT_DIM = 3 * 32 * 32   # 3 072
+    NUM_CLASSES = 10
+
+    def __init__(self, dropout_rate: float = 0.3, gate_init: float = 0.0):
+        super().__init__()
+
+        # ── Hidden layer 1: 3072 → 1024 ────────────────────────────────────
+        self.fc1 = PrunableLinear(self.INPUT_DIM, 1024, gate_init=gate_init)
+        self.bn1 = nn.BatchNorm1d(1024)
+
+        # ── Hidden layer 2: 1024 → 512 ─────────────────────────────────────
+        self.fc2 = PrunableLinear(1024, 512, gate_init=gate_init)
+        self.bn2 = nn.BatchNorm1d(512)
+
+        # ── Hidden layer 3: 512 → 256 ──────────────────────────────────────
+        self.fc3 = PrunableLinear(512, 256, gate_init=gate_init)
+        self.bn3 = nn.BatchNorm1d(256)
+
+        # ── Output layer: 256 → 10 ─────────────────────────────────────────
+        # No BatchNorm or Dropout on the final logit layer
+        self.fc4 = PrunableLinear(256, self.NUM_CLASSES, gate_init=gate_init)
+
+        # ── Shared activations ──────────────────────────────────────────────
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=dropout_rate)
+
+        # Collect all prunable layers for convenient iteration
+        self._prunable_layers: list[PrunableLinear] = [
+            self.fc1, self.fc2, self.fc3, self.fc4
+        ]
+
+    # -----------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        x : Tensor of shape (batch, 3, 32, 32)
+
+        Returns
+        -------
+        logits : Tensor of shape (batch, 10)
+        """
+        # Flatten spatial dimensions: (B, 3, 32, 32) → (B, 3072)
+        x = x.view(x.size(0), -1)
+
+        # Hidden layer 1
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+
+        # Hidden layer 2
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+
+        # Hidden layer 3
+        x = self.fc3(x)
+        x = self.bn3(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+
+        # Output logits (no activation — CrossEntropyLoss expects raw logits)
+        x = self.fc4(x)
+        return x
+
+    # -----------------------------------------------------------------------
+    def sparsity_loss(self) -> torch.Tensor:
+        """
+        Sum of L1 norms of gate values across ALL prunable layers.
+
+        Total Loss = CrossEntropyLoss + λ × sparsity_loss()
+        """
+        return sum(layer.sparsity_loss() for layer in self._prunable_layers)
+
+    # -----------------------------------------------------------------------
+    def sparsity_stats(self, threshold: float = 1e-2) -> dict:
+        """
+        Compute network-wide sparsity statistics.
+
+        Returns a dict with keys:
+            pruned_weights  – total number of near-zero gates
+            total_weights   – total number of weight parameters
+            sparsity_pct    – sparsity as a percentage
+            layer_stats     – per-layer breakdown
+        """
+        total_pruned = 0
+        total_weights = 0
+        layer_stats = {}
+
+        for idx, layer in enumerate(self._prunable_layers, start=1):
+            pruned, total = layer.count_pruned(threshold)
+            total_pruned += pruned
+            total_weights += total
+            layer_stats[f"fc{idx}"] = {
+                "pruned": pruned,
+                "total": total,
+                "sparsity_pct": 100.0 * pruned / total if total > 0 else 0.0,
+            }
+
+        sparsity_pct = 100.0 * total_pruned / total_weights if total_weights > 0 else 0.0
+
+        return {
+            "pruned_weights": total_pruned,
+            "total_weights": total_weights,
+            "sparsity_pct": sparsity_pct,
+            "layer_stats": layer_stats,
+        }
+
+    # -----------------------------------------------------------------------
+    def all_gate_values(self) -> torch.Tensor:
+        """
+        Concatenate all gate values from every layer into a single 1-D tensor.
+        Useful for plotting the global gate distribution.
+        """
+        return torch.cat(
+            [layer.gates().detach().flatten() for layer in self._prunable_layers]
+        )
